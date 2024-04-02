@@ -672,6 +672,7 @@ async fn generate_stream_with_callback(
 
     let stream = async_stream::stream! {
         // Inference
+        let mut first_token = true;
         let mut end_reached = false;
         let mut error = false;
 
@@ -711,8 +712,14 @@ async fn generate_stream_with_callback(
                                         prefill_tokens_length = tokens_length;
                                     }
                                     // Yield event for every new token
-                                    InferStreamResponse::Token(token) => {
+                                    InferStreamResponse::Token(mut token) => {
                                         tracing::debug!(parent: &span, "Token: {:?}", token);
+
+                                        // Strip left space before first token
+                                        if first_token {
+                                            token.text = token.text.trim_start().to_string();
+                                            first_token = false;
+                                        }
 
                                         // StreamResponse
                                         let stream_token = StreamResponse {

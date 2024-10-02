@@ -3,7 +3,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.distributed
 from opentelemetry import trace
-from transformers.models.llama import LlamaTokenizerFast
+from transformers import AutoTokenizer
 
 from lorax_server.models import FlashCausalLM
 from lorax_server.models.custom_modeling.flash_mistral_modeling import (
@@ -51,7 +51,7 @@ class FlashMistral(FlashCausalLM):
         else:
             raise NotImplementedError("FlashLlama is only available on GPU")
 
-        tokenizer = LlamaTokenizerFast.from_pretrained(
+        tokenizer = AutoTokenizer.from_pretrained(
             model_id,
             revision=revision,
             padding_side="left",
@@ -73,7 +73,8 @@ class FlashMistral(FlashCausalLM):
         )
         weights._set_config(model_id, config)
 
-        model = FlashMistralForCausalLM(config, weights)
+        prefix = ""
+        model = FlashMistralForCausalLM(prefix, config, weights)
 
         torch.distributed.barrier(group=self.process_group)
         super(FlashMistral, self).__init__(
@@ -83,6 +84,7 @@ class FlashMistral(FlashCausalLM):
             num_layers=len(model.model.layers),
             num_kv_heads=model.model.num_key_value_heads,
             head_size=model.model.head_size,
+            num_heads=model.model.num_heads,
             dtype=dtype,
             device=device,
             rank=rank,

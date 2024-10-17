@@ -336,6 +336,7 @@ impl Validation {
             .validate_input(request.inputs, truncate, max_new_tokens)
             .await?;
 
+
         let parameters = NextTokenChooserParameters {
             temperature,
             repetition_penalty,

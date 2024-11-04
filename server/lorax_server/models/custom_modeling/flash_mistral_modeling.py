@@ -30,6 +30,7 @@ from transformers.configuration_utils import PretrainedConfig
 
 from lorax_server.adapters import AdapterBatchData
 from lorax_server.utils import flash_attn, paged_attention
+from lorax_server.utils.attention.common import Seqlen
 from lorax_server.utils.flash_attn import HAS_FLASH_ATTN_V2_CUDA
 from lorax_server.utils.layers import (
     MultiAdapterHead,
@@ -52,6 +53,7 @@ from lorax_server.utils.lora import (
     UP_PROJ,
     V_PROJ,
 )
+from lorax_server.utils.torch_utils import is_fp8_kv, is_quantized
 
 if not HAS_FLASH_ATTN_V2_CUDA:
     raise ImportError("Mistral model requires flash attn v2")
@@ -204,7 +206,7 @@ def _load_gqa(config, prefix: str, weights, head_size):
     if type(weight) is tuple:
         weight, input_scale, weight_scale = weight
 
-    if config.quantize not in ["gptq", "awq", "fp8"]:
+    if not is_quantized(config.quantize):
         weight = weight.to(dtype=weights.dtype).to(device=weights.device)
 
         num_heads = config.num_attention_heads // weights.process_group.size()
@@ -259,6 +261,14 @@ class MistralAttention(torch.nn.Module):
             )
         self.num_heads = self.num_heads // weights.process_group.size()
         self.num_key_value_heads = config.num_key_value_heads // weights.process_group.size()
+        if is_fp8_kv(config.quantize):
+            self.k_scale = weights.get_tensor(f"{prefix}.k_scale", use_self_dtype=False).item()
+            self.v_scale = weights.get_tensor(f"{prefix}.v_scale", use_self_dtype=False).item()
+            self.fp8_kv = True
+        else:
+            self.k_scale = 1.0
+            self.v_scale = 1.0
+            self.fp8_kv = False
 
         self.query_key_value = load_attention(config, prefix, weights, layer_id, self.head_size)
 
@@ -308,7 +318,7 @@ class MistralAttention(torch.nn.Module):
         kv_cache,
         block_tables,
         slots,
-        input_lengths,
+        seqlen,
         max_s,
         adapter_data,
         prefill_cache_indices,
@@ -332,7 +342,16 @@ class MistralAttention(torch.nn.Module):
         else:
             kv_to_cache = kv
 
-        paged_attention.reshape_and_cache(kv_to_cache[:, 0], kv_to_cache[:, 1], kv_cache[0], kv_cache[1], slots)
+        paged_attention.reshape_and_cache(
+            kv_to_cache[:, 0],
+            kv_to_cache[:, 1],
+            kv_cache[0],
+            kv_cache[1],
+            slots,
+            self.k_scale,
+            self.v_scale,
+            self.fp8_kv,
+        )
 
         # Prefill
         if cu_seqlen_prefill is not None:
@@ -347,6 +366,9 @@ class MistralAttention(torch.nn.Module):
                 max_s,
                 self.softmax_scale,
                 window_size_left=self.max_past,
+                k_scale=self.k_scale,
+                v_scale=self.v_scale,
+                fp8_kv=self.fp8_kv,
             )
         # Decode
         else:
@@ -358,8 +380,10 @@ class MistralAttention(torch.nn.Module):
                 self.kv_head_mapping,
                 self.softmax_scale,
                 block_tables,
-                input_lengths,
+                seqlen,
                 max_s,
+                k_scale=self.k_scale,
+                v_scale=self.v_scale,
             )
 
         return self.o_proj(attn_output.view(-1, self.num_heads * self.head_size), adapter_data)
@@ -445,7 +469,7 @@ class MistralLayer(nn.Module):
         kv_cache,
         block_tables,
         slots,
-        input_lengths,
+        seqlen,
         max_s,
         adapter_data,
         prefill_cache_indices,
@@ -461,7 +485,7 @@ class MistralLayer(nn.Module):
             kv_cache,
             block_tables,
             slots,
-            input_lengths,
+            seqlen,
             max_s,
             adapter_data,
             prefill_cache_indices,
@@ -509,7 +533,7 @@ class MistralModel(torch.nn.Module):
         kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
         block_tables: torch.Tensor,
         slots: torch.Tensor,
-        input_lengths: torch.Tensor,
+        seqlen: Seqlen,
         max_s: int,
         adapter_data: AdapterBatchData,
         prefill_cache_indices: Optional[torch.Tensor],
@@ -531,7 +555,7 @@ class MistralModel(torch.nn.Module):
                 kv_cache[i],
                 block_tables,
                 slots,
-                input_lengths,
+                seqlen,
                 max_s,
                 adapter_data,
                 prefill_cache_indices,
@@ -581,7 +605,7 @@ class FlashMistralForCausalLM(torch.nn.Module):
         kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
         block_tables: torch.Tensor,
         slots: torch.Tensor,
-        input_lengths: torch.Tensor,
+        seqlen: Seqlen,
         max_s: int,
         adapter_data: AdapterBatchData,
         prefill_cache_indices: Optional[torch.Tensor] = None,
@@ -594,7 +618,7 @@ class FlashMistralForCausalLM(torch.nn.Module):
             # Clamp in decode mode as paged attention requires clamped values whereas the flash attention
             # kernel requires the true values
             max_s = min(self.max_past, max_s)
-            input_lengths = torch.clamp(input_lengths, max=self.max_past)
+            seqlen = seqlen.clamp(max=self.max_past)
 
         inputs_embeds = self.embed_tokens(input_ids)
         hidden_states = self.model(
@@ -604,7 +628,7 @@ class FlashMistralForCausalLM(torch.nn.Module):
             kv_cache,
             block_tables,
             slots,
-            input_lengths,
+            seqlen,
             max_s,
             adapter_data,
             prefill_cache_indices,

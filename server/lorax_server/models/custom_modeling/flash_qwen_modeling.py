@@ -17,6 +17,7 @@ from transformers.configuration_utils import PretrainedConfig
 from lorax_server.adapters import AdapterBatchData
 from lorax_server.models.custom_modeling.utils import prepend
 from lorax_server.utils import flash_attn, paged_attention
+from lorax_server.utils.attention.common import Seqlen
 from lorax_server.utils.layers import (
     MultiAdapterHead,
     PositionRotaryEmbedding,
@@ -28,6 +29,7 @@ from lorax_server.utils.layers import (
     TensorParallelRowLinear,
 )
 from lorax_server.utils.lora import LM_HEAD
+from lorax_server.utils.torch_utils import is_fp8_kv
 
 ATTN_C_ATTN = "attn.c_attn"
 ATTN_C_PROJ = "attn.c_proj"
@@ -199,6 +201,14 @@ class FlashQwenAttention(torch.nn.Module):
             )
         self.num_heads = self.num_heads // weights.process_group.size()
         self.num_key_value_heads = self.num_heads
+        if is_fp8_kv(config.quantize):
+            self.k_scale = weights.get_tensor(f"{prefix}.k_scale", use_self_dtype=False).item()
+            self.v_scale = weights.get_tensor(f"{prefix}.v_scale", use_self_dtype=False).item()
+            self.fp8_kv = True
+        else:
+            self.k_scale = 1.0
+            self.v_scale = 1.0
+            self.fp8_kv = False
 
         self.c_attn = load_attention(config, prefix, weights, layer_id)
 
@@ -227,7 +237,7 @@ class FlashQwenAttention(torch.nn.Module):
         kv_cache,
         block_tables,
         slots,
-        input_lengths,
+        seqlen,
         max_s,
         adapter_data,
     ):
@@ -245,7 +255,16 @@ class FlashQwenAttention(torch.nn.Module):
         self.rotary_emb(query, cos, sin)
         self.rotary_emb(torch.select(kv, dim=1, index=0), cos, sin)
 
-        paged_attention.reshape_and_cache(kv[:, 0], kv[:, 1], kv_cache[0], kv_cache[1], slots)
+        paged_attention.reshape_and_cache(
+            kv[:, 0],
+            kv[:, 1],
+            kv_cache[0],
+            kv_cache[1],
+            slots,
+            self.k_scale,
+            self.v_scale,
+            self.fp8_kv,
+        )
 
         # Prefill
         if cu_seqlen_prefill is not None:
@@ -259,6 +278,9 @@ class FlashQwenAttention(torch.nn.Module):
                 cu_seqlen_prefill,
                 max_s,
                 self.softmax_scale,
+                k_scale=self.k_scale,
+                v_scale=self.v_scale,
+                fp8_kv=self.fp8_kv,
             )
         # Decode
         else:
@@ -271,8 +293,10 @@ class FlashQwenAttention(torch.nn.Module):
                 self.kv_head_mapping,
                 self.softmax_scale,
                 block_tables,
-                input_lengths,
+                seqlen,
                 max_s,
+                k_scale=self.k_scale,
+                v_scale=self.v_scale,
             )
 
         return self.c_proj(attn_output.view(-1, self.num_heads * self.head_size), adapter_data)
@@ -357,7 +381,7 @@ class FlashQwenLayer(nn.Module):
         kv_cache,
         block_tables,
         slots,
-        input_lengths,
+        seqlen,
         max_s,
         adapter_data,
     ):
@@ -372,7 +396,7 @@ class FlashQwenLayer(nn.Module):
             kv_cache,
             block_tables,
             slots,
-            input_lengths,
+            seqlen,
             max_s,
             adapter_data,
         )
@@ -422,7 +446,7 @@ class FlashQwenModel(torch.nn.Module):
         kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
         block_tables: torch.Tensor,
         slots: torch.Tensor,
-        input_lengths: torch.Tensor,
+        seqlen: Seqlen,
         max_s: int,
         adapter_data: AdapterBatchData,
     ) -> torch.Tensor:
@@ -443,7 +467,7 @@ class FlashQwenModel(torch.nn.Module):
                 kv_cache[i],
                 block_tables,
                 slots,
-                input_lengths,
+                seqlen,
                 max_s,
                 adapter_data,
             )
@@ -478,7 +502,7 @@ class FlashQwenForCausalLM(torch.nn.Module):
         kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
         block_tables: torch.Tensor,
         slots: torch.Tensor,
-        input_lengths: torch.Tensor,
+        seqlen: Seqlen,
         max_s: int,
         adapter_data: AdapterBatchData,
         prefill_cache_indices: Optional[torch.Tensor] = None,
@@ -491,7 +515,7 @@ class FlashQwenForCausalLM(torch.nn.Module):
             kv_cache,
             block_tables,
             slots,
-            input_lengths,
+            seqlen,
             max_s,
             adapter_data,
         )

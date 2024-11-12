@@ -12,7 +12,7 @@ use std::io::Cursor;
 use std::iter;
 use thiserror::Error;
 use tokenizers::tokenizer::Tokenizer;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{instrument, Span};
 use {once_cell::sync::Lazy, regex::Regex};
 
@@ -25,7 +25,7 @@ pub struct Validation {
     max_input_length: usize,
     max_total_tokens: usize,
     /// Channel to communicate with the background tokenization task
-    sender: Option<flume::Sender<TokenizerRequest>>,
+    sender: Option<mpsc::UnboundedSender<TokenizerRequest>>,
 }
 
 impl Validation {
@@ -41,15 +41,17 @@ impl Validation {
     ) -> Self {
         // If we have a fast tokenizer
         let sender = if let Some(tokenizer) = tokenizer {
-            // Create channel
-            let (validation_sender, validation_receiver) = flume::unbounded();
+            // Create round robin channel
+            let (validation_sender, validation_round_robin_receiver) = mpsc::unbounded_channel();
+            let mut senders = Vec::with_capacity(workers);
 
             // Create workers
             for _ in 0..workers {
                 let tokenizer_clone = tokenizer.clone();
                 let config_clone = config.clone();
                 let preprocessor_config_clone = preprocessor_config.clone();
-                let receiver_clone = validation_receiver.clone();
+                let (tokenizer_sender, tokenizer_receiver) = mpsc::unbounded_channel();
+                senders.push(tokenizer_sender);
 
                 // Spawn worker
                 tokio::task::spawn_blocking(move || {
@@ -57,10 +59,14 @@ impl Validation {
                         tokenizer_clone,
                         config_clone,
                         preprocessor_config_clone,
-                        receiver_clone,
+                        tokenizer_receiver,
                     )
                 });
             }
+
+            // Create tokenization round robin task
+            tokio::spawn(round_robin_task(validation_round_robin_receiver, senders));
+
             Some(validation_sender)
         } else {
             None
@@ -79,6 +85,7 @@ impl Validation {
     pub async fn tokenize(
         &self,
         inputs: String,
+        add_special_tokens: bool,
         truncate: Option<usize>,
     ) -> Result<Option<(tokenizers::Encoding, Vec<Chunk>)>, ValidationError> {
         // If we have a fast tokenizer
@@ -88,7 +95,11 @@ impl Validation {
             // Send request to the background validation task
             // Unwrap is safe here
             sender
-                .send(((inputs, truncate), response_sender, Span::current()))
+                .send((
+                    (inputs, add_special_tokens, truncate),
+                    response_sender,
+                    Span::current(),
+                ))
                 .unwrap();
 
             // Await on response channel
@@ -104,11 +115,15 @@ impl Validation {
     pub(crate) async fn validate_input(
         &self,
         inputs: String,
+        add_special_tokens: bool,
         truncate: Option<usize>,
         max_new_tokens: Option<u32>,
     ) -> Result<(Option<TokenizedInputs>, usize), ValidationError> {
         // If we have a fast tokenizer
-        if let Some((encoding, chunks)) = self.tokenize(inputs.clone(), truncate).await? {
+        if let Some((encoding, chunks)) = self
+            .tokenize(inputs.clone(), add_special_tokens, truncate)
+            .await?
+        {
             // Create response channel
             let input_length = encoding.len();
 
@@ -187,6 +202,8 @@ impl Validation {
             best_of,
             temperature,
             repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
             top_k,
             top_p,
             typical_p,
@@ -244,6 +261,16 @@ impl Validation {
         let repetition_penalty = repetition_penalty.unwrap_or(1.0);
         if repetition_penalty <= 0.0 {
             return Err(ValidationError::RepetitionPenalty);
+        }
+
+        let frequency_penalty = frequency_penalty.unwrap_or(0.0);
+        if !(-2.0..=2.0).contains(&frequency_penalty) {
+            return Err(ValidationError::FrequencyPenalty);
+        }
+
+        let presence_penalty = presence_penalty.unwrap_or(0.0);
+        if !(-2.0..=2.0).contains(&presence_penalty) {
+            return Err(ValidationError::PresencePenalty);
         }
 
         // Different because the proto default value is not a valid value
@@ -333,13 +360,20 @@ impl Validation {
         // Validate inputs
         let inputs = request.inputs.clone();
         let (tokenized_inputs, input_length) = self
-            .validate_input(request.inputs, truncate, max_new_tokens)
+            .validate_input(
+                request.inputs,
+                request.add_special_tokens,
+                truncate,
+                max_new_tokens,
+            )
             .await?;
 
 
         let parameters = NextTokenChooserParameters {
             temperature,
             repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
             top_k,
             top_p,
             typical_p,
@@ -391,20 +425,38 @@ impl Validation {
     }
 }
 
+/// Round robin tokenization task
+async fn round_robin_task(
+    mut receiver: mpsc::UnboundedReceiver<TokenizerRequest>,
+    senders: Vec<mpsc::UnboundedSender<TokenizerRequest>>,
+) {
+    loop {
+        for sender in &senders {
+            match receiver.recv().await {
+                None => return,
+                Some(request) => sender.send(request).unwrap(),
+            };
+        }
+    }
+}
+
 /// Start tokenization workers
 fn tokenizer_worker(
     tokenizer: Tokenizer,
     config: Option<Config>,
     preprocessor_config: Option<HubPreprocessorConfig>,
-    receiver: flume::Receiver<TokenizerRequest>,
+    mut receiver: mpsc::UnboundedReceiver<TokenizerRequest>,
 ) {
     // Loop over requests
-    while let Ok(((inputs, truncate), response_tx, parent_span)) = receiver.recv() {
+    while let Some(((inputs, add_special_tokens, truncate), response_tx, parent_span)) =
+        receiver.blocking_recv()
+    {
         parent_span.in_scope(|| {
             response_tx
                 .send(prepare_input(
                     inputs,
                     truncate,
+                    add_special_tokens,
                     &tokenizer,
                     config.as_ref(),
                     preprocessor_config.as_ref(),
@@ -541,6 +593,7 @@ fn image_tokens_fixup(config: &Config, text: String) -> String {
 fn prepare_input(
     inputs: String,
     _truncate: Option<usize>,
+    add_special_tokens: bool,
     tokenizer: &Tokenizer,
     config: Option<&Config>,
     preprocessor_config: Option<&HubPreprocessorConfig>,
@@ -579,14 +632,14 @@ fn prepare_input(
 
     // Get the number of tokens in the input
     let encoding = tokenizer
-        .encode(tokenizer_query, true)
+        .encode(tokenizer_query, add_special_tokens)
         .map_err(|err| ValidationError::Tokenizer(err.to_string()))?;
 
     Ok((encoding, input_chunks))
 }
 
 type TokenizerRequest = (
-    (String, Option<usize>),
+    (String, bool, Option<usize>),
     oneshot::Sender<Result<(tokenizers::Encoding, Vec<Chunk>), ValidationError>>,
     Span,
 );
@@ -643,6 +696,10 @@ pub enum ValidationError {
     Temperature,
     #[error("`repetition_penalty` must be strictly positive")]
     RepetitionPenalty,
+    #[error("`frequency_penalty` must be >= -2.0 and <= 2.0")]
+    FrequencyPenalty,
+    #[error("`presence_penalty` must be >= -2.0 and <= 2.0")]
+    PresencePenalty,
     #[error("`top_p` must be > 0.0 and < 1.0")]
     TopP,
     #[error("`top_k` must be strictly positive")]
@@ -719,7 +776,7 @@ mod tests {
 
         let max_new_tokens = Some(10);
         match validation
-            .validate_input("Hello".to_string(), None, max_new_tokens)
+            .validate_input("Hello".to_string(), true, None, max_new_tokens)
             .await
         {
             Err(ValidationError::MaxNewTokens(1, 10)) => (),
@@ -749,7 +806,7 @@ mod tests {
 
         let max_new_tokens = Some(10);
         match validation
-            .validate_input("Hello".to_string(), None, max_new_tokens)
+            .validate_input("Hello".to_string(), true, None, max_new_tokens)
             .await
         {
             Err(ValidationError::MaxTotalTokens(5, 1, 10)) => (),
@@ -785,6 +842,7 @@ mod tests {
                         do_sample: false,
                         ..default_parameters()
                     },
+                    add_special_tokens: true,
                 },
                 Adapter::new(
                     AdapterParameters {
@@ -830,6 +888,7 @@ mod tests {
                         top_p: Some(1.0),
                         ..default_parameters()
                     },
+                    add_special_tokens: true,
                 },
                 Adapter::new(
                     AdapterParameters {
@@ -856,6 +915,7 @@ mod tests {
                         max_new_tokens: Some(1),
                         ..default_parameters()
                     },
+                    add_special_tokens: true,
                 },
                 Adapter::new(
                     AdapterParameters {
@@ -882,6 +942,7 @@ mod tests {
                         max_new_tokens: Some(1),
                         ..default_parameters()
                     },
+                    add_special_tokens: true,
                 },
                 Adapter::new(
                     AdapterParameters {
